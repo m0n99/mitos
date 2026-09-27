@@ -222,6 +222,8 @@ impl MappableCommand {
         kill_to_line_end => super::insert::kill_to_line_end, "Delete till end of line",
         undo => super::history::undo, "Undo change",
         redo => super::history::redo, "Redo change",
+        undo_selection => super::history::undo_selection, "Undo selection change",
+        redo_selection => super::history::redo_selection, "Redo selection change",
         earlier => super::history::earlier, "Move backward in history",
         later => super::history::later, "Move forward in history",
         commit_undo_checkpoint => super::history::commit_undo_checkpoint, "Commit changes to new checkpoint",

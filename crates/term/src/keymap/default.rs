@@ -232,6 +232,8 @@ pub fn default() -> HashMap<Mode, KeyTrie> {
         "C-s" => save_selection,
 
         "space" => { "Space"
+            "u" => undo_selection,
+            "U" => redo_selection,
             "f" => file_picker,
             "F" => file_picker_in_current_directory,
             "e" => file_explorer,

@@ -166,6 +166,7 @@ pub struct Document {
     text: Rope,
     binary: bool,
     selections: HashMap<ViewId, Selection>,
+    selection_history: HashMap<ViewId, SelectionHistory>,
     view_data: HashMap<ViewId, ViewData>,
     pub active_snippet: Option<ActiveSnippet>,
 
@@ -288,6 +289,14 @@ pub struct Document {
     // of storing a copy on every doc. Then we can remove the surrounding `Arc` and use the
     // `ArcSwap` directly.
     syn_loader: Arc<ArcSwap<syntax::Loader>>,
+}
+
+const SELECTION_HISTORY_LIMIT: usize = 256;
+
+#[derive(Default)]
+struct SelectionHistory {
+    snapshots: Vec<Selection>,
+    current: usize,
 }
 
 struct DocumentSymbolCache {
@@ -862,6 +871,7 @@ impl Document {
             text,
             binary: false,
             selections: HashMap::default(),
+            selection_history: HashMap::default(),
             inlay_hints: HashMap::default(),
             inlay_hints_oudated: false,
             view_data: Default::default(),
@@ -1590,13 +1600,67 @@ impl Document {
 
     /// Select text within the [`Document`].
     pub fn set_selection(&mut self, view_id: ViewId, selection: Selection) {
-        // TODO: use a transaction?
-        self.selections
-            .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+        self.update_selection(view_id, selection, true);
+    }
+
+    fn update_selection(&mut self, view_id: ViewId, selection: Selection, record: bool) {
+        let selection = selection.ensure_invariants(self.text().slice(..));
+        if record {
+            let history = self.selection_history.entry(view_id).or_default();
+            if history.snapshots.is_empty() {
+                history.snapshots.push(
+                    self.selections
+                        .get(&view_id)
+                        .cloned()
+                        .unwrap_or_else(|| selection.clone()),
+                );
+                history.current = history.snapshots.len().saturating_sub(1);
+            }
+            if history.snapshots.get(history.current) != Some(&selection) {
+                history.snapshots.truncate(history.current + 1);
+                history.snapshots.push(selection.clone());
+                history.current += 1;
+            }
+            if history.snapshots.len() > SELECTION_HISTORY_LIMIT {
+                let excess = history.snapshots.len() - SELECTION_HISTORY_LIMIT;
+                history.snapshots.drain(..excess);
+                history.current -= excess;
+            }
+        }
+        self.selections.insert(view_id, selection);
         event::dispatch(SelectionDidChange {
             doc: self,
             view: view_id,
         })
+    }
+
+    /// Undo selection changes for a view without changing document text.
+    pub fn undo_selection(&mut self, view: &mut View, count: usize) -> bool {
+        let Some(history) = self.selection_history.get_mut(&view.id) else {
+            return false;
+        };
+        if count == 0 || history.current == 0 {
+            return false;
+        }
+        history.current -= count.min(history.current);
+        let selection = history.snapshots[history.current].clone();
+        self.update_selection(view.id, selection, false);
+        true
+    }
+
+    /// Redo selection changes for a view without changing document text.
+    pub fn redo_selection(&mut self, view: &mut View, count: usize) -> bool {
+        let Some(history) = self.selection_history.get_mut(&view.id) else {
+            return false;
+        };
+        let remaining = history.snapshots.len().saturating_sub(history.current + 1);
+        if count == 0 || remaining == 0 {
+            return false;
+        }
+        history.current += count.min(remaining);
+        let selection = history.snapshots[history.current].clone();
+        self.update_selection(view.id, selection, false);
+        true
     }
 
     /// Find the origin selection of the text in a document, i.e. where
@@ -1639,6 +1703,7 @@ impl Document {
     /// Remove any views' data and state that is stored in the `Document`.
     pub fn remove_view(&mut self, view_id: ViewId) {
         self.selections.remove(&view_id);
+        self.selection_history.remove(&view_id);
         self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
@@ -1669,17 +1734,13 @@ impl Document {
 
         if changes.is_empty() {
             if let Some(selection) = transaction.selection() {
-                self.selections.insert(
-                    view_id,
-                    selection.clone().ensure_invariants(self.text.slice(..)),
-                );
-                event::dispatch(SelectionDidChange {
-                    doc: self,
-                    view: view_id,
-                });
+                self.update_selection(view_id, selection.clone(), true);
             }
             return true;
         }
+
+        // Existing snapshots contain offsets in the old text and must not be replayed against it.
+        self.selection_history.clear();
 
         self.modified_since_accessed = true;
         self.version += 1;
@@ -1833,14 +1894,19 @@ impl Document {
 
         // if specified, the current selection should instead be replaced by transaction.selection
         if let Some(selection) = transaction.selection() {
-            self.selections.insert(
-                view_id,
-                selection.clone().ensure_invariants(self.text.slice(..)),
+            self.update_selection(view_id, selection.clone(), false);
+        }
+
+        // Seed fresh histories from selections after change mapping and optional transaction
+        // selection have both been applied.
+        for (&view, selection) in &self.selections {
+            self.selection_history.insert(
+                view,
+                SelectionHistory {
+                    snapshots: vec![selection.clone()],
+                    current: 0,
+                },
             );
-            event::dispatch(SelectionDidChange {
-                doc: self,
-                view: view_id,
-            });
         }
 
         true
@@ -3176,6 +3242,106 @@ mod test {
             .to_string(),
             editor_core::NATIVE_LINE_ENDING.as_str()
         );
+    }
+
+    #[test]
+    fn selection_history_undo_redo_branches_and_clamps() {
+        let mut doc = Document::from(
+            Rope::from("abcdef"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let mut view = View::new(doc.id, Default::default());
+        doc.ensure_view_init(view.id);
+        let initial = doc.selection(view.id).clone();
+        doc.set_selection(view.id, Selection::point(2));
+        doc.set_selection(view.id, Selection::point(4));
+        let selection_at =
+            |point| Selection::point(point).ensure_invariants(Rope::from("abcdef").slice(..));
+
+        assert!(doc.undo_selection(&mut view, 1));
+        assert_eq!(doc.selection(view.id), &selection_at(2));
+        assert!(doc.undo_selection(&mut view, usize::MAX));
+        assert_eq!(doc.selection(view.id), &initial);
+        assert!(!doc.undo_selection(&mut view, 1));
+        assert!(doc.redo_selection(&mut view, usize::MAX));
+        assert_eq!(doc.selection(view.id), &selection_at(4));
+        assert!(!doc.redo_selection(&mut view, 1));
+
+        assert!(doc.undo_selection(&mut view, 1));
+        doc.set_selection(view.id, Selection::point(3));
+        assert!(!doc.redo_selection(&mut view, 1));
+        assert!(doc.undo_selection(&mut view, 1));
+        assert_eq!(doc.selection(view.id), &selection_at(2));
+    }
+
+    #[test]
+    fn selection_history_isolated_by_view_and_reset_by_edits() {
+        let mut doc = Document::from(
+            Rope::from("hello"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let mut ids = slotmap::SlotMap::<ViewId, ()>::with_key();
+        let first_id = ids.insert(());
+        let second_id = ids.insert(());
+        let mut first = View::new(doc.id, Default::default());
+        let mut second = View::new(doc.id, Default::default());
+        first.id = first_id;
+        second.id = second_id;
+        doc.ensure_view_init(first.id);
+        doc.ensure_view_init(second.id);
+        doc.set_selection(first.id, Selection::point(2));
+        doc.set_selection(second.id, Selection::point(3));
+        let second_selection = doc.selection(second.id).clone();
+
+        assert!(doc.undo_selection(&mut first, 1));
+        assert_eq!(doc.selection(second.id), &second_selection);
+
+        let edit = Transaction::change(doc.text(), [(0, 1, Some("H".into()))].into_iter());
+        assert!(doc.apply(&edit, first.id));
+        assert!(!doc.undo_selection(&mut first, 1));
+        assert!(!doc.redo_selection(&mut first, 1));
+    }
+
+    #[test]
+    fn selection_history_restarts_from_post_edit_selection() {
+        let mut doc = Document::from(
+            Rope::from("abcdef"),
+            None,
+            Arc::new(ArcSwap::new(Arc::new(Config::default()))),
+            Arc::new(ArcSwap::from_pointee(syntax::Loader::default())),
+        );
+        let mut view = View::new(doc.id, Default::default());
+        doc.ensure_view_init(view.id);
+        doc.set_selection(view.id, Selection::point(4));
+
+        let insert = Transaction::change(doc.text(), [(0, 0, Some("XX".into()))].into_iter());
+        assert!(doc.apply(&insert, view.id));
+        assert!(!doc.undo_selection(&mut view, 1));
+        let after_insert = doc.selection(view.id).clone();
+        doc.set_selection(view.id, Selection::point(2));
+        assert!(doc.undo_selection(&mut view, 1));
+        assert_eq!(doc.selection(view.id), &after_insert);
+
+        let delete = Transaction::change(doc.text(), [(0, 2, None)].into_iter());
+        assert!(doc.apply(&delete, view.id));
+        assert!(!doc.undo_selection(&mut view, 1));
+        let after_delete = doc.selection(view.id).clone();
+        doc.set_selection(view.id, Selection::point(1));
+        assert!(doc.undo_selection(&mut view, 1));
+        assert_eq!(doc.selection(view.id), &after_delete);
+
+        let delete_with_selection = Transaction::change(doc.text(), [(0, 1, None)].into_iter())
+            .with_selection(Selection::point(2));
+        assert!(doc.apply(&delete_with_selection, view.id));
+        assert!(!doc.undo_selection(&mut view, 1));
+        let transaction_selection = doc.selection(view.id).clone();
+        doc.set_selection(view.id, Selection::point(4));
+        assert!(doc.undo_selection(&mut view, 1));
+        assert_eq!(doc.selection(view.id), &transaction_selection);
     }
 
     macro_rules! decode {

@@ -25,6 +25,22 @@ pub(super) fn redo(cx: &mut Context) {
     }
 }
 
+pub(super) fn undo_selection(cx: &mut Context) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    if !doc.undo_selection(view, count) {
+        cx.editor.set_status("Already at oldest selection");
+    }
+}
+
+pub(super) fn redo_selection(cx: &mut Context) {
+    let count = cx.count();
+    let (view, doc) = current!(cx.editor);
+    if !doc.redo_selection(view, count) {
+        cx.editor.set_status("Already at newest selection");
+    }
+}
+
 pub(super) fn earlier(cx: &mut Context) {
     let count = cx.count();
     let (view, doc) = current!(cx.editor);

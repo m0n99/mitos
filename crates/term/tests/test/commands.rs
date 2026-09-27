@@ -643,6 +643,15 @@ async fn test_undo_redo() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_selection_undo_redo() -> anyhow::Result<()> {
+    test(("#[|]#abc", "ll<space>u", "a#[b|]#c")).await?;
+    test(("#[|]#abc", "ll<space>u<space>u", "#[a|]#bc")).await?;
+    test(("#[|]#abc", "ll<space>u<space>U", "ab#[c|]#")).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_extend_line() -> anyhow::Result<()> {
     // extend with line selected then count
     test((
