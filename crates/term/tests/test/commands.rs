@@ -644,9 +644,30 @@ async fn test_undo_redo() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_selection_undo_redo() -> anyhow::Result<()> {
-    test(("#[|]#abc", "ll<space>u", "a#[b|]#c")).await?;
-    test(("#[|]#abc", "ll<space>u<space>u", "#[a|]#bc")).await?;
-    test(("#[|]#abc", "ll<space>u<space>U", "ab#[c|]#")).await?;
+    use editor_core::hashmap;
+    use term::keymap::macros::keymap;
+
+    let mut config = helpers::test_config();
+    config.keys = std::collections::HashMap::from([(
+        view::document::Mode::Normal,
+        term::keymap!({ "Normal mode"
+            "space" => { "Space"
+                "u" => undo_selection,
+                "U" => redo_selection,
+            },
+        }),
+    )]);
+
+    test_with_config(
+        AppBuilder::new().with_config(config.clone()),
+        ("#[|]#abc", "ll<space>u", "a#[b|]#c"),
+    )
+    .await?;
+    test_with_config(
+        AppBuilder::new().with_config(config),
+        ("#[|]#abc", "ll<space>u<space>U", "ab#[c|]#"),
+    )
+    .await?;
 
     Ok(())
 }
